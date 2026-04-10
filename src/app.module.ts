@@ -4,9 +4,11 @@ import { TypeOrmModule } from '@nestjs/typeorm';
 import { AuthModule } from './auth/auth.module';
 import { TenantsModule } from './tenants/tenants.module';
 import { UsersModule } from './users/users.module';
+import { EventsModule } from './events/events.module';
 import { TenantMiddleware } from './common/middleware/tenant.middleware';
 import { Tenant } from './tenants/tenant.entity';
 import { User } from './users/user.entity';
+import { AuditEvent } from './events/audit-event.entity';
 import { AppController } from './app.controller';
 
 @Module({
@@ -22,13 +24,14 @@ import { AppController } from './app.controller';
         username: configService.get<string>('DB_USER'),
         password: configService.get<string>('DB_PASSWORD'),
         database: configService.get<string>('DB_NAME'),
-        entities: [Tenant, User],
+        entities: [Tenant, User, AuditEvent],
         synchronize: true,
       }),
     }),
     AuthModule,
     TenantsModule,
     UsersModule,
+    EventsModule,
   ],
   controllers: [AppController],
 })

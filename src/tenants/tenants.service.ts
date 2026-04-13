@@ -1,13 +1,21 @@
 import { Injectable, ConflictException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
-import { randomUUID } from 'crypto';
+import { randomUUID, createHash } from 'crypto';
 import * as bcrypt from 'bcrypt';
 import { Tenant } from './tenant.entity';
 import { User, UserRole } from '../users/user.entity';
 import { RegisterTenantDto } from './dto/register-tenant.dto';
 
 export { RegisterTenantDto };
+
+// API keys are high-entropy random strings (256 bits). SHA-256 is appropriate
+// here — unlike passwords, API keys do not benefit from bcrypt's intentional
+// slowness because an attacker who obtains the hash still cannot reverse a
+// 32-byte random key in feasible time.
+export function hashApiKey(apiKey: string): string {
+  return createHash('sha256').update(apiKey).digest('hex');
+}
 
 @Injectable()
 export class TenantsService {
@@ -27,10 +35,13 @@ export class TenantsService {
       throw new ConflictException('Tenant with this email already exists');
     }
 
+    // Generate a plaintext API key — shown to the tenant once, never stored.
+    const plaintextApiKey = `pak_${randomUUID().replace(/-/g, '')}`;
+
     const tenant = new Tenant();
     tenant.name = dto.name;
     tenant.email = dto.email;
-    tenant.apiKey = `pak_${randomUUID().replace(/-/g, '')}`;
+    tenant.apiKeyHash = hashApiKey(plaintextApiKey);
     tenant.retentionDays = 90;
     tenant.isActive = true;
 
@@ -52,15 +63,25 @@ export class TenantsService {
         id: savedTenant.id,
         name: savedTenant.name,
         email: savedTenant.email,
-        apiKey: savedTenant.apiKey,
+        // Plaintext key returned once. After this point only the hash is stored.
+        apiKey: plaintextApiKey,
         retentionDays: savedTenant.retentionDays,
         createdAt: savedTenant.createdAt,
       },
-      message: 'Tenant registered successfully. Save your API key — it will not be shown again.',
+      message:
+        'Tenant registered successfully. Save your API key — it will not be shown again.',
     };
   }
 
-  async findById(id: string) {
+  async findById(id: string): Promise<Tenant | null> {
     return this.tenantsRepository.findOne({ where: { id } });
+  }
+
+  // Used by ApiKeyGuard: hash the incoming key and look up in one DB query.
+  async findByApiKeyHash(apiKey: string): Promise<Tenant | null> {
+    const hash = hashApiKey(apiKey);
+    return this.tenantsRepository.findOne({
+      where: { apiKeyHash: hash, isActive: true },
+    });
   }
 }

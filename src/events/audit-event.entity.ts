@@ -77,6 +77,22 @@ export class AuditEvent {
   @Column({ name: 'occurred_at' })
   occurredAt: Date;
 
+  /**
+   * Hash chain columns.
+   *
+   * prevHash: the `hash` value of the immediately preceding event for this
+   *   tenant (null for the first event in the chain).
+   *
+   * hash: SHA-256 of the deterministic string formed from this event's
+   *   own fields concatenated with prevHash. Any modification to a stored
+   *   event breaks all subsequent hashes, making the log tamper-evident.
+   */
+  @Column({ name: 'prev_hash', nullable: true })
+  prevHash: string | null;
+
+  @Column({ name: 'hash' })
+  hash: string;
+
   @CreateDateColumn({ name: 'created_at' })
   createdAt: Date;
 }

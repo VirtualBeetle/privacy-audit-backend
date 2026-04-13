@@ -16,8 +16,8 @@ export class Tenant {
   @Column({ unique: true })
   email: string;
 
-  @Column({ name: 'api_key', unique: true })
-  apiKey: string;
+  @Column({ name: 'api_key_hash', unique: true })
+  apiKeyHash: string;
 
   @Column({ name: 'retention_days', default: 90 })
   retentionDays: number;

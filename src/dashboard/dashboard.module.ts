@@ -8,8 +8,10 @@ import { AuditEvent } from '../events/audit-event.entity';
 import { TenantsModule } from '../tenants/tenants.module';
 import { ExportsModule } from '../exports/exports.module';
 import { DeletionsModule } from '../deletions/deletions.module';
+import { DashboardUsersModule } from '../dashboard-users/dashboard-users.module';
+import { RiskModule } from '../risk/risk.module';
 import { ApiKeyGuard } from '../common/guards/api-key.guard';
-import { DashboardGuard } from '../common/guards/dashboard.guard';
+import { DashboardGuard, DashboardAnyGuard } from '../common/guards/dashboard.guard';
 
 @Module({
   imports: [
@@ -17,6 +19,8 @@ import { DashboardGuard } from '../common/guards/dashboard.guard';
     TenantsModule,
     ExportsModule,
     DeletionsModule,
+    DashboardUsersModule,
+    RiskModule,
     JwtModule.registerAsync({
       imports: [ConfigModule],
       inject: [ConfigService],
@@ -27,6 +31,6 @@ import { DashboardGuard } from '../common/guards/dashboard.guard';
     }),
   ],
   controllers: [DashboardController],
-  providers: [DashboardService, ApiKeyGuard, DashboardGuard],
+  providers: [DashboardService, ApiKeyGuard, DashboardGuard, DashboardAnyGuard],
 })
 export class DashboardModule {}

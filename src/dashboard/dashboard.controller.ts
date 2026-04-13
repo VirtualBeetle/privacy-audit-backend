@@ -12,10 +12,12 @@ import { Response } from 'express';
 import { DashboardService } from './dashboard.service';
 import { ExportsService } from '../exports/exports.service';
 import { DeletionsService } from '../deletions/deletions.service';
+import { RiskService } from '../risk/risk.service';
+import { DashboardUsersService } from '../dashboard-users/dashboard-users.service';
 import { CreateDashboardTokenDto } from './dto/create-dashboard-token.dto';
 import { ExchangeTokenDto } from './dto/exchange-token.dto';
 import { ApiKeyGuard } from '../common/guards/api-key.guard';
-import { DashboardGuard } from '../common/guards/dashboard.guard';
+import { DashboardGuard, DashboardAnyGuard } from '../common/guards/dashboard.guard';
 import { CurrentUser } from '../common/decorators/tenant.decorator';
 
 @Controller('dashboard')
@@ -24,18 +26,15 @@ export class DashboardController {
     private readonly dashboardService: DashboardService,
     private readonly exportsService: ExportsService,
     private readonly deletionsService: DeletionsService,
+    private readonly riskService: RiskService,
+    private readonly dashboardUsersService: DashboardUsersService,
   ) {}
 
   // ─── Auth ──────────────────────────────────────────────────────────────────
 
   /**
    * POST /api/dashboard/token
-   *
-   * Called by the tenant app backend (API key auth) to get a short-lived
-   * handshake token for one of its users. The tenant embeds this token in the
-   * "View my privacy" link that the user clicks.
-   *
-   * Response: { token, expiresIn: '15 minutes', redirectUrl }
+   * Tenant app requests a 15-min handshake token for one of its users.
    */
   @Post('token')
   @UseGuards(ApiKeyGuard)
@@ -45,13 +44,7 @@ export class DashboardController {
 
   /**
    * POST /api/dashboard/session
-   *
-   * Called by the dashboard frontend when the user lands on /auth/redirect.
-   * Validates the 15-min handshake token and issues an 8-hour session JWT.
-   *
-   * No auth header needed — the handshake token is the credential.
-   *
-   * Response: { sessionToken, tenantId, tenantUserId, expiresIn: '8 hours' }
+   * Exchange a 15-min handshake token for an 8-hour session JWT.
    */
   @Post('session')
   exchangeToken(@Body() dto: ExchangeTokenDto) {
@@ -62,27 +55,57 @@ export class DashboardController {
 
   /**
    * GET /api/dashboard/events
-   *
-   * Returns all audit events for the authenticated dashboard user.
-   * The session JWT encodes tenantId + tenantUserId — no query params needed.
-   * A user can only ever read their own events within their own tenant.
+   * Returns audit events for the authenticated user.
+   * Accepts both dashboard_session and google_session tokens.
    */
   @Get('events')
-  @UseGuards(DashboardGuard)
+  @UseGuards(DashboardAnyGuard)
   getEvents(@CurrentUser() user: any) {
-    return this.dashboardService.getEvents(user.tenantId, user.tenantUserId);
+    return this.dashboardService.getEvents(user);
   }
 
-  // ─── Exports (GDPR Article 20 — Right to Data Portability) ───────────────
+  // ─── Account Linking ───────────────────────────────────────────────────────
+
+  /**
+   * POST /api/dashboard/link-account
+   *
+   * Links the calling user's tenant account (from their dashboard_session)
+   * to their Google identity (provided as googleSessionToken in the body).
+   * After linking, their `google_session` will aggregate events from this tenant.
+   *
+   * Body: { googleSessionToken: string }
+   */
+  @Post('link-account')
+  @UseGuards(DashboardGuard)
+  linkAccount(
+    @CurrentUser() user: any,
+    @Body() body: { googleSessionToken: string },
+  ) {
+    return this.dashboardService.linkAccount(user, body.googleSessionToken);
+  }
+
+  /**
+   * GET /api/dashboard/linked-accounts
+   * Returns all tenant accounts linked to the Google identity.
+   * Requires google_session.
+   */
+  @Get('linked-accounts')
+  @UseGuards(DashboardAnyGuard)
+  async getLinkedAccounts(@CurrentUser() user: any) {
+    if (user.type !== 'google_session') {
+      return { linkedAccounts: [] };
+    }
+    const accounts = await this.dashboardUsersService.getLinkedAccounts(
+      user.dashboardUserId,
+    );
+    return { linkedAccounts: accounts };
+  }
+
+  // ─── Exports (GDPR Article 20) ─────────────────────────────────────────────
 
   /**
    * POST /api/dashboard/exports
-   *
-   * User requests a full export of their audit data (GDPR Article 20).
-   * The export is processed asynchronously — this returns 202 immediately.
-   *
-   * Response: { requestId, status: 'requested', message }
-   * Next step: poll GET /api/dashboard/exports/:id
+   * Request a full data export. Processed async — returns 202 immediately.
    */
   @Post('exports')
   @UseGuards(DashboardGuard)
@@ -94,10 +117,7 @@ export class DashboardController {
 
   /**
    * GET /api/dashboard/exports/:id
-   *
    * Poll the status of an export request.
-   * When status === 'completed' and downloadAvailable === true, the user can
-   * call GET /api/dashboard/exports/:id/download.
    */
   @Get('exports/:id')
   @UseGuards(DashboardGuard)
@@ -107,8 +127,7 @@ export class DashboardController {
 
   /**
    * GET /api/dashboard/exports/:id/download
-   *
-   * Download the completed export as an attachment (JSON file).
+   * Download the completed export as a JSON attachment.
    * Returns 410 Gone if the 24-hour download window has expired.
    */
   @Get('exports/:id/download')
@@ -123,28 +142,19 @@ export class DashboardController {
       user.tenantId,
       user.tenantUserId,
     );
-
-    const filename = `privacy-export-${id}.json`;
-
     res.setHeader('Content-Type', 'application/json');
     res.setHeader(
       'Content-Disposition',
-      `attachment; filename="${filename}"`,
+      `attachment; filename="privacy-export-${id}.json"`,
     );
-    res.status(HttpStatus.OK).json(data);
+    return res.status(HttpStatus.OK).json(data);
   }
 
-  // ─── Deletions (GDPR Article 17 — Right to Erasure) ──────────────────────
+  // ─── Deletions (GDPR Article 17) ──────────────────────────────────────────
 
   /**
    * POST /api/dashboard/deletions
-   *
-   * User requests erasure of all their audit data (GDPR Article 17).
-   * Processed asynchronously. After completion, no audit events for this user
-   * will exist in the tenant's dataset. A non-personal evidence record is
-   * retained for regulatory accountability (GDPR Article 5(2)).
-   *
-   * Response: { requestId, status: 'requested', message }
+   * Request erasure of all user audit data. Processed async.
    */
   @Post('deletions')
   @UseGuards(DashboardGuard)
@@ -156,17 +166,34 @@ export class DashboardController {
 
   /**
    * GET /api/dashboard/deletions/:id
-   *
    * Poll the status of a deletion request.
-   * When status === 'completed', eventsDeleted shows how many records were removed.
    */
   @Get('deletions/:id')
   @UseGuards(DashboardGuard)
   getDeletionStatus(@CurrentUser() user: any, @Param('id') id: string) {
-    return this.deletionsService.getStatus(
-      id,
-      user.tenantId,
-      user.tenantUserId,
-    );
+    return this.deletionsService.getStatus(id, user.tenantId, user.tenantUserId);
+  }
+
+  // ─── AI Risk Alerts ────────────────────────────────────────────────────────
+
+  /**
+   * GET /api/dashboard/risk-alerts
+   *
+   * Returns the most recent AI-generated privacy risk alerts for the user's
+   * tenant(s). Accepts both dashboard_session and google_session.
+   */
+  @Get('risk-alerts')
+  @UseGuards(DashboardAnyGuard)
+  async getRiskAlerts(@CurrentUser() user: any) {
+    let linkedTenantIds: string[] = [];
+
+    if (user.type === 'google_session') {
+      const linked = await this.dashboardUsersService.getLinkedAccounts(
+        user.dashboardUserId,
+      );
+      linkedTenantIds = linked.map((l) => l.tenantId);
+    }
+
+    return this.riskService.getAlertsForUser(user, linkedTenantIds);
   }
 }

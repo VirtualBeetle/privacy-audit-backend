@@ -1,9 +1,12 @@
 import { Injectable, ConflictException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
+import { InjectQueue } from '@nestjs/bullmq';
+import { Queue } from 'bullmq';
 import { createHash } from 'crypto';
 import { AuditEvent } from './audit-event.entity';
 import { CreateEventDto } from './dto/create-event.dto';
+import { AUDIT_EVENTS_QUEUE } from '../queue/queue.constants';
 
 /**
  * computeEventHash
@@ -38,52 +41,44 @@ export class EventsService {
   constructor(
     @InjectRepository(AuditEvent)
     private eventsRepository: Repository<AuditEvent>,
+    @InjectQueue(AUDIT_EVENTS_QUEUE)
+    private readonly auditQueue: Queue,
   ) {}
 
-  async create(tenantId: string, dto: CreateEventDto): Promise<AuditEvent> {
+  /**
+   * create
+   *
+   * Performs a fast idempotency check, then enqueues the event for async
+   * processing by AuditEventProcessor. Returns 202 Accepted immediately.
+   * The processor handles hash-chain computation and DB persistence.
+   */
+  async create(
+    tenantId: string,
+    dto: CreateEventDto,
+  ): Promise<{ jobId: string | undefined; message: string }> {
+    // Fast-fail on obvious duplicates before the job even hits the queue.
+    // The processor also checks — this guards against immediate double-submits.
     const existing = await this.eventsRepository.findOne({
       where: { eventId: dto.eventId },
     });
-
     if (existing) {
       throw new ConflictException(
         'Event with this eventId already exists — duplicate rejected',
       );
     }
 
-    // Fetch the latest event for this tenant to continue the hash chain.
-    const lastEvent = await this.eventsRepository.findOne({
-      where: { tenantId },
-      order: { createdAt: 'DESC' },
-    });
+    const job = await this.auditQueue.add(
+      'process-event',
+      { tenantId, dto },
+      {
+        attempts: 3,
+        backoff: { type: 'exponential', delay: 1000 },
+        removeOnComplete: true,
+        removeOnFail: 100,
+      },
+    );
 
-    const prevHash = lastEvent?.hash ?? null;
-
-    const event = new AuditEvent();
-    event.tenantId = tenantId;
-    event.tenantUserId = dto.tenantUserId;
-    event.eventId = dto.eventId;
-    event.actionCode = dto.action.code;
-    event.actionLabel = dto.action.label;
-    event.dataFields = dto.dataFields;
-    event.reasonCode = dto.reason.code;
-    event.reasonLabel = dto.reason.label;
-    event.actorType = dto.actor.type;
-    event.actorLabel = dto.actor.label;
-    event.actorIdentifier = dto.actor.identifier ?? null;
-    event.sensitivityCode = dto.sensitivity.code;
-    event.thirdPartyInvolved = dto.thirdPartyInvolved ?? false;
-    event.thirdPartyName = dto.thirdPartyName ?? null;
-    event.retentionDays = dto.retentionDays ?? 90;
-    event.region = dto.region ?? null;
-    event.consentObtained = dto.consentObtained ?? false;
-    event.userOptedOut = dto.userOptedOut ?? false;
-    event.meta = dto.meta ?? null;
-    event.occurredAt = new Date(dto.occurredAt);
-    event.prevHash = prevHash;
-    event.hash = computeEventHash(event, prevHash);
-
-    return this.eventsRepository.save(event);
+    return { jobId: job.id, message: 'Event accepted and queued for processing' };
   }
 
   async findAll(

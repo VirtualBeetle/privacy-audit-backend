@@ -5,6 +5,8 @@ import {
   Body,
   Query,
   UseGuards,
+  HttpCode,
+  HttpStatus,
 } from '@nestjs/common';
 import { EventsService } from './events.service';
 import { CreateEventDto } from './dto/create-event.dto';
@@ -24,6 +26,7 @@ export class EventsController {
    */
   @Post()
   @UseGuards(ApiKeyGuard)
+  @HttpCode(HttpStatus.ACCEPTED)
   create(@CurrentUser() user: any, @Body() dto: CreateEventDto) {
     return this.eventsService.create(user.tenantId, dto);
   }

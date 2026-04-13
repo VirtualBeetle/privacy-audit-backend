@@ -1,23 +1,13 @@
-import {
-  Injectable,
-  UnauthorizedException,
-} from '@nestjs/common';
+import { Injectable, UnauthorizedException, BadRequestException } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import { ConfigService } from '@nestjs/config';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { AuditEvent } from '../events/audit-event.entity';
+import { DashboardUsersService } from '../dashboard-users/dashboard-users.service';
 import { CreateDashboardTokenDto } from './dto/create-dashboard-token.dto';
 import { ExchangeTokenDto } from './dto/exchange-token.dto';
 
-/**
- * Token type discriminators.
- *
- * We use one JWT_SECRET for all tokens in the system, but we embed a `type`
- * claim in every payload so that each guard can reject tokens that were issued
- * for a different purpose. A session token cannot be used as a dashboard token
- * and vice versa.
- */
 const DASHBOARD_TOKEN_TYPE = 'dashboard_token';
 const DASHBOARD_SESSION_TYPE = 'dashboard_session';
 
@@ -28,35 +18,26 @@ export class DashboardService {
     private readonly configService: ConfigService,
     @InjectRepository(AuditEvent)
     private readonly eventsRepository: Repository<AuditEvent>,
+    private readonly dashboardUsersService: DashboardUsersService,
   ) {}
 
+  // ─── Auth ─────────────────────────────────────────────────────────────────
+
   /**
-   * issueToken
-   *
-   * Called by the tenant application (authenticated with an API key) to
-   * generate a short-lived handshake token for one of its users.
-   *
-   * The tenant app embeds this token in the link it shows the user:
-   *   https://dashboard.example.com/auth/redirect?token=<token>
-   *
-   * TTL is intentionally short (15 minutes) — the user is expected to click
-   * the link immediately. The token cannot be reused after exchange.
+   * issueToken — called by tenant apps (API key auth).
+   * Returns a 15-minute handshake JWT the user exchanges for a session.
    */
   issueToken(
     tenantId: string,
     dto: CreateDashboardTokenDto,
   ): { token: string; expiresIn: string; redirectUrl: string } {
-    const payload = {
-      type: DASHBOARD_TOKEN_TYPE,
-      tenantId,
-      tenantUserId: dto.tenantUserId,
-    };
-
-    const token = this.jwtService.sign(payload, { expiresIn: '15m' });
+    const token = this.jwtService.sign(
+      { type: DASHBOARD_TOKEN_TYPE, tenantId, tenantUserId: dto.tenantUserId },
+      { expiresIn: '15m' },
+    );
 
     const baseUrl =
-      this.configService.get<string>('DASHBOARD_BASE_URL') ??
-      'http://localhost:3000';
+      this.configService.get<string>('DASHBOARD_BASE_URL') ?? 'http://localhost:3000';
 
     return {
       token,
@@ -66,16 +47,8 @@ export class DashboardService {
   }
 
   /**
-   * exchangeToken
-   *
-   * Called by the dashboard frontend when the user lands on /auth/redirect.
-   * Validates the short-lived handshake token and issues a longer-lived
-   * session JWT that the frontend stores and uses for all subsequent API calls.
-   *
-   * Why two tokens?
-   *   The handshake token lives in a URL — it can appear in browser history,
-   *   server logs, and referrer headers. Exchanging it for a session token
-   *   immediately limits its exposure window to a single redirect.
+   * exchangeToken — called by the dashboard frontend (/auth/redirect page).
+   * Validates the handshake token and issues an 8-hour session JWT.
    */
   exchangeToken(dto: ExchangeTokenDto): {
     sessionToken: string;
@@ -84,7 +57,6 @@ export class DashboardService {
     expiresIn: string;
   } {
     let payload: any;
-
     try {
       payload = this.jwtService.verify(dto.token);
     } catch {
@@ -95,15 +67,10 @@ export class DashboardService {
       throw new UnauthorizedException('Token type mismatch');
     }
 
-    const sessionPayload = {
-      type: DASHBOARD_SESSION_TYPE,
-      tenantId: payload.tenantId,
-      tenantUserId: payload.tenantUserId,
-    };
-
-    const sessionToken = this.jwtService.sign(sessionPayload, {
-      expiresIn: '8h',
-    });
+    const sessionToken = this.jwtService.sign(
+      { type: DASHBOARD_SESSION_TYPE, tenantId: payload.tenantId, tenantUserId: payload.tenantUserId },
+      { expiresIn: '8h' },
+    );
 
     return {
       sessionToken,
@@ -113,22 +80,88 @@ export class DashboardService {
     };
   }
 
+  // ─── Events ───────────────────────────────────────────────────────────────
+
   /**
-   * getEvents
+   * getEvents — returns audit events for the authenticated dashboard user.
    *
-   * Returns all audit events for the authenticated dashboard user, scoped to
-   * their tenant. The session token already carries both tenantId and
-   * tenantUserId, so no additional parameters are needed.
+   * dashboard_session: events scoped to the user's (tenantId, tenantUserId).
+   * google_session: events across all linked tenant accounts.
    */
-  async getEvents(
-    tenantId: string,
-    tenantUserId: string,
-  ): Promise<AuditEvent[]> {
+  async getEvents(user: {
+    type: string;
+    tenantId?: string;
+    tenantUserId?: string;
+    dashboardUserId?: string;
+  }): Promise<AuditEvent[]> {
+    if (user.type === 'dashboard_session') {
+      return this.eventsRepository
+        .createQueryBuilder('event')
+        .where('event.tenant_id = :tenantId', { tenantId: user.tenantId })
+        .andWhere('event.tenant_user_id = :tenantUserId', { tenantUserId: user.tenantUserId })
+        .orderBy('event.occurred_at', 'DESC')
+        .getMany();
+    }
+
+    // google_session: aggregate across all linked tenant accounts
+    const linked = await this.dashboardUsersService.getLinkedAccounts(
+      user.dashboardUserId!,
+    );
+
+    if (linked.length === 0) return [];
+
+    const conditions = linked
+      .map((_, i) => `(event.tenant_id = :t${i} AND event.tenant_user_id = :u${i})`)
+      .join(' OR ');
+
+    const params = Object.fromEntries(
+      linked.flatMap((l, i) => [
+        [`t${i}`, l.tenantId],
+        [`u${i}`, l.tenantUserId],
+      ]),
+    );
+
     return this.eventsRepository
       .createQueryBuilder('event')
-      .where('event.tenant_id = :tenantId', { tenantId })
-      .andWhere('event.tenant_user_id = :tenantUserId', { tenantUserId })
+      .where(conditions, params)
       .orderBy('event.occurred_at', 'DESC')
       .getMany();
+  }
+
+  // ─── Account Linking ──────────────────────────────────────────────────────
+
+  /**
+   * linkAccount — links a tenant account (from a dashboard_session) to a
+   * Google identity (from a google_session). The user calls this while they
+   * have both tokens — e.g. after logging in via Google and also visiting from
+   * a tenant "View my privacy" link.
+   */
+  async linkAccount(
+    dashboardSessionUser: { tenantId: string; tenantUserId: string },
+    googleSessionToken: string,
+  ): Promise<{ linked: boolean; message: string }> {
+    let googlePayload: any;
+    try {
+      googlePayload = this.jwtService.verify(googleSessionToken);
+    } catch {
+      throw new UnauthorizedException('Google session token is invalid or expired');
+    }
+
+    if (googlePayload.type !== 'google_session') {
+      throw new BadRequestException('Provided token is not a google_session token');
+    }
+
+    const result = await this.dashboardUsersService.linkAccount(
+      googlePayload.dashboardUserId,
+      dashboardSessionUser.tenantId,
+      dashboardSessionUser.tenantUserId,
+    );
+
+    return {
+      linked: result.linked,
+      message: result.linked
+        ? 'Tenant account linked to your Google identity'
+        : 'Account was already linked',
+    };
   }
 }
